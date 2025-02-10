@@ -3,18 +3,8 @@ import asyncio
 import aiofiles
 import json
 from bs4 import BeautifulSoup
-from contextlib import asynccontextmanager
 
-SEMAPHORE = asyncio.Semaphore(5)
-
-
-@asynccontextmanager
-async def limit_concurrency(semaphore):
-    await semaphore.acquire()
-    try:
-        yield
-    finally:
-        semaphore.release()
+MAX_CONCURRENT_REQUESTS = 5
 
 
 async def fetch_url(session, url):
@@ -41,18 +31,38 @@ async def fetch_url(session, url):
         return url, None
 
 
-async def fetch_urls(input_file, output_file):
-    async with aiohttp.ClientSession() as session:
-        async with aiofiles.open(input_file, mode="r") as f:
-            urls = [line.strip() for line in await f.readlines()]
+async def worker(session, queue, out_f):
+    while True:
+        url = await queue.get()
+        if url is None:
+            break
+        url, content = await fetch_url(session, url)
+        if content is not None:
+            result = {"url": url, "content": content}
+            await out_f.write(json.dumps(result) + "\n")
+        queue.task_done()
 
+
+async def fetch_urls(input_file, output_file):
+    queue = asyncio.Queue()
+
+    async with aiohttp.ClientSession() as session:
         async with aiofiles.open(output_file, mode="w") as out_f:
-            for url in urls:
-                async with limit_concurrency(SEMAPHORE):
-                    url, content = await fetch_url(session, url)
-                    if content is not None:
-                        result = {"url": url, "content": content}
-                        await out_f.write(json.dumps(result) + "\n")
+            workers = [
+                asyncio.create_task(worker(session, queue, out_f))
+                for _ in range(MAX_CONCURRENT_REQUESTS)
+            ]
+
+            async with aiofiles.open(input_file, mode="r") as f:
+                urls = [line.strip() for line in await f.readlines()]
+                for url in urls:
+                    await queue.put(url)
+
+            await queue.join()
+
+            for _ in range(MAX_CONCURRENT_REQUESTS):
+                await queue.put(None)
+            await asyncio.gather(*workers)
 
 
 async def main():
